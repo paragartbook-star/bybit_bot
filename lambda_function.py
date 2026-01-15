@@ -1,7 +1,6 @@
 import json
 import os
 import logging
-import time
 from typing import Dict, Optional, Any
 from pybit.unified_trading import HTTP
 import requests
@@ -210,7 +209,7 @@ def execute_bybit_order(
     take_profit: Optional[float] = None
 ) -> Dict[str, Any]:
     """
-    Execute order on Bybit Perpetual Futures.
+    Execute order on Bybit Perpetual Futures with integrated SL/TP.
     
     Args:
         bybit_client: Bybit HTTP client instance
@@ -227,16 +226,29 @@ def execute_bybit_order(
         # Normalize action to Bybit side
         side = "Buy" if action.upper() in ["BUY", "LONG"] else "Sell"
         
-        # Place market order
-        order_response = bybit_client.place_order(
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=str(quantity),
-            positionIdx=0,  # One-Way Mode
-            reduceOnly=False
-        )
+        # Build order parameters with integrated SL/TP
+        order_params = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": str(quantity),
+            "positionIdx": 0,
+            "reduceOnly": False
+        }
+        
+        # Add stop loss if provided
+        if stop_loss:
+            order_params["stopLoss"] = str(stop_loss)
+            order_params["slTriggerBy"] = "LastPrice"
+        
+        # Add take profit if provided
+        if take_profit:
+            order_params["takeProfit"] = str(take_profit)
+            order_params["tpTriggerBy"] = "LastPrice"
+        
+        # Place market order with integrated SL/TP
+        order_response = bybit_client.place_order(**order_params)
         
         if order_response.get('retCode') != 0:
             error_msg = order_response.get('retMsg', 'Unknown error')
@@ -252,42 +264,10 @@ def execute_bybit_order(
         
         logger.info(f"Order placed successfully: {order_id}")
         
-        # Set stop loss and take profit using set_trading_stop (recommended method)
-        # Wait a moment for the position to be established
-        time.sleep(0.5)  # Brief delay to ensure position is created
-        
-        if stop_loss or take_profit:
-            try:
-                trading_stop_params = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "positionIdx": 0
-                }
-                
-                if stop_loss:
-                    trading_stop_params["stopLoss"] = str(stop_loss)
-                
-                if take_profit:
-                    trading_stop_params["takeProfit"] = str(take_profit)
-                
-                sl_tp_response = bybit_client.set_trading_stop(**trading_stop_params)
-                
-                if sl_tp_response.get('retCode') == 0:
-                    logger.info(f"Stop loss and take profit set successfully")
-                else:
-                    logger.warning(f"Failed to set stop loss/take profit: {sl_tp_response.get('retMsg')}")
-                    
-            except Exception as e:
-                logger.warning(f"Error setting stop loss/take profit: {str(e)}")
-        
         # Get fill price from order execution
         fill_price = None
         try:
-            execution_response = bybit_client.get_open_orders(
-                category="linear",
-                symbol=symbol
-            )
-            # Try to get from trade history instead
+            # Try to get from trade history
             trade_response = bybit_client.get_executions(
                 category="linear",
                 symbol=symbol,
@@ -546,4 +526,3 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'error': f'Internal server error: {str(e)}'
             })
         }
-
