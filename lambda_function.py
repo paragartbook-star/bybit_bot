@@ -132,7 +132,8 @@ def calculate_position_size(
     bybit_client: HTTP,
     symbol: str,
     price: float,
-    risk_percent: float = 0.02
+    risk_percent: float = 0.02,
+    telegram_sent: bool = False  # 🔵 ADDED: Flag parameter
 ) -> Optional[float]:
     """
     Calculate dynamic position size based on account balance.
@@ -142,6 +143,7 @@ def calculate_position_size(
         symbol: Trading symbol
         price: Entry price
         risk_percent: Percentage of account balance to risk (default: 2%)
+        telegram_sent: Flag to prevent duplicate Telegram messages
         
     Returns:
         Position size (quantity) or None if calculation fails
@@ -157,10 +159,12 @@ def calculate_position_size(
         if response.get('retCode') != 0:
             error_msg = response.get('retMsg', 'Unknown error')
             logger.error(f"Failed to get account balance - retCode: {response.get('retCode')}, retMsg: {error_msg}")
-            send_telegram_error("Balance Fetch Failed", {
-                "Error Code": response.get('retCode'),
-                "Error Message": error_msg
-            })
+            # 🔵 ADDED: Check flag before sending Telegram error
+            if not telegram_sent:
+                send_telegram_error("Balance Fetch Failed", {
+                    "Error Code": response.get('retCode'),
+                    "Error Message": error_msg
+                })
             return None
         
         # Extract available balance
@@ -183,7 +187,9 @@ def calculate_position_size(
         
         if total_equity <= 0:
             logger.error("No USDT balance found")
-            send_telegram_message("⚠️ <b>Warning:</b> No USDT balance found in account")
+            # 🔵 ADDED: Check flag before sending Telegram message
+            if not telegram_sent:
+                send_telegram_message("⚠️ <b>Warning:</b> No USDT balance found in account")
             return None
         
         logger.info(f"Account USDT Balance: {total_equity}")
@@ -233,10 +239,12 @@ def calculate_position_size(
         
     except Exception as e:
         logger.error(f"Error calculating position size: {str(e)}")
-        send_telegram_error("Position Size Calculation Failed", {
-            "Symbol": symbol,
-            "Error": str(e)
-        })
+        # 🔵 ADDED: Check flag before sending Telegram error
+        if not telegram_sent:
+            send_telegram_error("Position Size Calculation Failed", {
+                "Symbol": symbol,
+                "Error": str(e)
+            })
         return None
 
 
@@ -246,7 +254,8 @@ def execute_bybit_order(
     symbol: str,
     quantity: float,
     stop_loss: Optional[float] = None,
-    take_profit: Optional[float] = None
+    take_profit: Optional[float] = None,
+    telegram_sent: bool = False  # 🔵 ADDED: Flag parameter
 ) -> Dict[str, Any]:
     """
     Execute order on Bybit Perpetual Futures (V5 API).
@@ -258,6 +267,7 @@ def execute_bybit_order(
         quantity: Position quantity
         stop_loss: Stop loss price (optional)
         take_profit: Take profit price (optional)
+        telegram_sent: Flag to prevent duplicate Telegram messages
         
     Returns:
         Dictionary with order result or error information
@@ -293,15 +303,16 @@ def execute_bybit_order(
             
             logger.error(f"Bybit order failed - retCode: {error_code}, retMsg: {error_msg}")
             
-            # Send detailed error to Telegram
-            send_telegram_error("Order Placement Failed", {
-                "Symbol": symbol,
-                "Action": side,
-                "Quantity": qty_str,
-                "Error Code": error_code,
-                "Error Message": error_msg,
-                "Full Response": json.dumps(order_response, indent=2)
-            })
+            # 🔵 ADDED: Check flag before sending Telegram error
+            if not telegram_sent:
+                send_telegram_error("Order Placement Failed", {
+                    "Symbol": symbol,
+                    "Action": side,
+                    "Quantity": qty_str,
+                    "Error Code": error_code,
+                    "Error Message": error_msg,
+                    "Full Response": json.dumps(order_response, indent=2)
+                })
             
             return {
                 'success': False,
@@ -349,16 +360,20 @@ def execute_bybit_order(
                     error_msg = sl_tp_response.get('retMsg', 'Unknown error')
                     logger.warning(f"Failed to set SL/TP - retCode: {sl_tp_response.get('retCode')}, retMsg: {error_msg}")
                     
-                    send_telegram_error("SL/TP Setup Failed", {
-                        "Symbol": symbol,
-                        "Error Code": sl_tp_response.get('retCode'),
-                        "Error Message": error_msg,
-                        "Note": "Order was placed successfully but SL/TP failed"
-                    })
+                    # 🔵 ADDED: Check flag before sending Telegram error
+                    if not telegram_sent:
+                        send_telegram_error("SL/TP Setup Failed", {
+                            "Symbol": symbol,
+                            "Error Code": sl_tp_response.get('retCode'),
+                            "Error Message": error_msg,
+                            "Note": "Order was placed successfully but SL/TP failed"
+                        })
                     
             except Exception as e:
                 logger.warning(f"Error setting stop loss/take profit: {str(e)}")
-                send_telegram_message(f"⚠️ <b>Warning:</b> SL/TP setup failed\n\n{str(e)}")
+                # 🔵 ADDED: Check flag before sending Telegram message
+                if not telegram_sent:
+                    send_telegram_message(f"⚠️ <b>Warning:</b> SL/TP setup failed\n\n{str(e)}")
         
         # ✅ Bybit V5: Get fill price from execution history
         fill_price = None
@@ -393,11 +408,13 @@ def execute_bybit_order(
     except Exception as e:
         logger.error(f"Error executing Bybit order: {str(e)}", exc_info=True)
         
-        send_telegram_error("Order Execution Error", {
-            "Symbol": symbol,
-            "Action": action,
-            "Error": str(e)
-        })
+        # 🔵 ADDED: Check flag before sending Telegram error
+        if not telegram_sent:
+            send_telegram_error("Order Execution Error", {
+                "Symbol": symbol,
+                "Action": action,
+                "Error": str(e)
+            })
         
         return {
             'success': False,
@@ -426,6 +443,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         HTTP response dictionary
     """
+    # 🔵 ADDED: Initialize Telegram flag at the very beginning
+    telegram_sent = False
+    
     # Validate environment variables
     if not validate_environment_variables():
         return {
@@ -461,7 +481,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not action:
             error_msg = 'Missing required field: action'
             logger.error(error_msg)
-            send_telegram_message(f"❌ <b>Webhook Error:</b> {error_msg}")
+            # 🔵 ADDED: Check flag before sending Telegram message
+            if not telegram_sent:
+                send_telegram_message(f"❌ <b>Webhook Error:</b> {error_msg}")
+                telegram_sent = True
             return {
                 'statusCode': 400,
                 'body': json.dumps({
@@ -473,7 +496,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not symbol:
             error_msg = 'Missing required field: symbol'
             logger.error(error_msg)
-            send_telegram_message(f"❌ <b>Webhook Error:</b> {error_msg}")
+            # 🔵 ADDED: Check flag before sending Telegram message
+            if not telegram_sent:
+                send_telegram_message(f"❌ <b>Webhook Error:</b> {error_msg}")
+                telegram_sent = True
             return {
                 'statusCode': 400,
                 'body': json.dumps({
@@ -498,10 +524,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         except Exception as e:
             error_msg = f"Failed to initialize Bybit client: {str(e)}"
             logger.error(error_msg)
-            send_telegram_error("Bybit Client Initialization Failed", {
-                "Error": str(e),
-                "Testnet": BYBIT_TESTNET
-            })
+            # 🔵 ADDED: Check flag before sending Telegram error
+            if not telegram_sent:
+                send_telegram_error("Bybit Client Initialization Failed", {
+                    "Error": str(e),
+                    "Testnet": BYBIT_TESTNET
+                })
+                telegram_sent = True
             return {
                 'statusCode': 500,
                 'body': json.dumps({
@@ -523,7 +552,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if not price:
                 error_msg = "Cannot calculate position size: price is required when qty is not provided"
                 logger.error(error_msg)
-                send_telegram_message(f"❌ <b>Error:</b> {error_msg}")
+                # 🔵 ADDED: Check flag before sending Telegram message
+                if not telegram_sent:
+                    send_telegram_message(f"❌ <b>Error:</b> {error_msg}")
+                    telegram_sent = True
                 return {
                     'statusCode': 400,
                     'body': json.dumps({
@@ -534,7 +566,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
             try:
                 entry_price = float(price)
-                quantity = calculate_position_size(bybit_client, symbol, entry_price)
+                # 🔵 ADDED: Pass telegram_sent flag to calculate_position_size
+                quantity = calculate_position_size(bybit_client, symbol, entry_price, telegram_sent=telegram_sent)
                 
                 if not quantity or quantity <= 0:
                     error_msg = 'Failed to calculate position size'
@@ -550,7 +583,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except (ValueError, TypeError) as e:
                 error_msg = f'Invalid price value: {price}'
                 logger.error(error_msg)
-                send_telegram_message(f"❌ <b>Error:</b> {error_msg}")
+                # 🔵 ADDED: Check flag before sending Telegram message
+                if not telegram_sent:
+                    send_telegram_message(f"❌ <b>Error:</b> {error_msg}")
+                    telegram_sent = True
                 return {
                     'statusCode': 400,
                     'body': json.dumps({
@@ -575,26 +611,31 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.info(f"Final order parameters - Symbol: {symbol}, Action: {action}, Qty: {quantity}, SL: {sl_price}, TP: {tp_price}")
         
         # ✅ Execute order with Bybit V5 API
+        # 🔵 ADDED: Pass telegram_sent flag to execute_bybit_order
         order_result = execute_bybit_order(
             bybit_client=bybit_client,
             action=action,
             symbol=symbol,
             quantity=quantity,
             stop_loss=sl_price,
-            take_profit=tp_price
+            take_profit=tp_price,
+            telegram_sent=telegram_sent
         )
         
         if not order_result.get('success'):
             error_msg = order_result.get('error', 'Unknown error')
             error_code = order_result.get('error_code', 'N/A')
             
-            send_telegram_error("Order Execution Failed", {
-                "Symbol": symbol,
-                "Action": action,
-                "Quantity": quantity,
-                "Error Code": error_code,
-                "Error Message": error_msg
-            })
+            # 🔵 ADDED: Check flag before sending Telegram error
+            if not telegram_sent:
+                send_telegram_error("Order Execution Failed", {
+                    "Symbol": symbol,
+                    "Action": action,
+                    "Quantity": quantity,
+                    "Error Code": error_code,
+                    "Error Message": error_msg
+                })
+                telegram_sent = True
             
             return {
                 'statusCode': 500,
@@ -613,17 +654,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except (ValueError, TypeError):
                 fill_price = 0.0
         
-        # Send Telegram success notification
-        telegram_message = format_telegram_notification(
-            symbol=symbol,
-            action=action,
-            entry_price=fill_price or 0.0,
-            quantity=quantity,
-            stop_loss=sl_price,
-            take_profit=tp_price,
-            order_id=order_result.get('order_id')
-        )
-        send_telegram_message(telegram_message)
+        # 🔵 ADDED: Check flag before sending success notification
+        if not telegram_sent:
+            # Send Telegram success notification
+            telegram_message = format_telegram_notification(
+                symbol=symbol,
+                action=action,
+                entry_price=fill_price or 0.0,
+                quantity=quantity,
+                stop_loss=sl_price,
+                take_profit=tp_price,
+                order_id=order_result.get('order_id')
+            )
+            send_telegram_message(telegram_message)
+            telegram_sent = True  # 🔵 ADDED: Set flag after successful send
         
         # Return success response
         response_data = {
@@ -648,7 +692,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         error_msg = f'Invalid JSON: {str(e)}'
         logger.error(error_msg)
-        send_telegram_message(f"❌ <b>JSON Parse Error:</b> {error_msg}")
+        # 🔵 ADDED: Check flag before sending Telegram message
+        if not telegram_sent:
+            send_telegram_message(f"❌ <b>JSON Parse Error:</b> {error_msg}")
+            telegram_sent = True
         return {
             'statusCode': 400,
             'body': json.dumps({
@@ -661,10 +708,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         error_msg = f'Internal server error: {str(e)}'
         logger.error(error_msg, exc_info=True)
         
-        send_telegram_error("Unexpected Lambda Error", {
-            "Error": str(e),
-            "Type": type(e).__name__
-        })
+        # 🔵 ADDED: Check flag before sending Telegram error
+        if not telegram_sent:
+            send_telegram_error("Unexpected Lambda Error", {
+                "Error": str(e),
+                "Type": type(e).__name__
+            })
+            telegram_sent = True
         
         return {
             'statusCode': 500,
