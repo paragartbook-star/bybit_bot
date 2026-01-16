@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import time
 from typing import Dict, Optional, Any
 from pybit.unified_trading import HTTP
 import requests
@@ -15,10 +16,6 @@ BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 BYBIT_TESTNET = os.environ.get('BYBIT_TESTNET', 'false').lower() == 'true'
-
-# NEW: Configurable account type and category from environment variables
-ACCOUNT_TYPE = os.environ.get('ACCOUNT_TYPE', 'UNIFIED')  # Default: UNIFIED
-CATEGORY = os.environ.get('CATEGORY', 'linear')  # Default: linear (perpetual futures)
 
 
 def validate_environment_variables() -> bool:
@@ -36,54 +33,16 @@ def validate_environment_variables() -> bool:
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         return False
     
-    logger.info(f"Configuration: TESTNET={BYBIT_TESTNET}, ACCOUNT_TYPE={ACCOUNT_TYPE}, CATEGORY={CATEGORY}")
     return True
 
 
-def normalize_symbol(raw_symbol: str) -> str:
-    """
-    Normalize TradingView symbol format to Bybit format.
-    
-    Removes exchange prefixes (BYBIT:, BINANCE:, etc.) and suffixes (.P, .PERP, etc.)
-    
-    Examples:
-        "BYBIT:BTCUSDT.P" -> "BTCUSDT"
-        "BINANCE:ETHUSDT.P" -> "ETHUSDT"
-        "btcusdt" -> "BTCUSDT"
-    
-    Args:
-        raw_symbol: Raw symbol string from TradingView
-        
-    Returns:
-        Normalized symbol in Bybit format (uppercase, no prefixes/suffixes)
-    """
-    if not raw_symbol:
-        return ""
-    
-    # Convert to uppercase
-    symbol = raw_symbol.upper()
-    
-    # Remove exchange prefixes (BYBIT:, BINANCE:, etc.)
-    if ':' in symbol:
-        symbol = symbol.split(':', 1)[1]
-    
-    # Remove common suffixes (.P, .PERP, .PERPETUAL, etc.)
-    suffixes_to_remove = ['.P', '.PERP', '.PERPETUAL', '-PERP', '-PERPETUAL']
-    for suffix in suffixes_to_remove:
-        if symbol.endswith(suffix):
-            symbol = symbol[:-len(suffix)]
-            break
-    
-    logger.info(f"Symbol normalized: {raw_symbol} -> {symbol}")
-    return symbol
-
-
-def send_telegram_message(message: str) -> bool:
+def send_telegram_message(message: str, parse_mode: str = 'HTML') -> bool:
     """
     Send a message to Telegram bot.
     
     Args:
         message: Message text to send
+        parse_mode: Telegram parse mode (default: HTML)
         
     Returns:
         True if successful, False otherwise
@@ -93,7 +52,7 @@ def send_telegram_message(message: str) -> bool:
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
-            'parse_mode': 'HTML'
+            'parse_mode': parse_mode
         }
         
         response = requests.post(url, json=payload, timeout=10)
@@ -107,6 +66,22 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
+def send_telegram_error(error_title: str, error_details: Dict[str, Any]) -> None:
+    """
+    Send formatted error message to Telegram.
+    
+    Args:
+        error_title: Error title/category
+        error_details: Dictionary containing error details
+    """
+    message = f"❌ <b>{error_title}</b>\n\n"
+    
+    for key, value in error_details.items():
+        message += f"<b>{key}:</b> {value}\n"
+    
+    send_telegram_message(message)
+
+
 def format_telegram_notification(
     symbol: str,
     action: str,
@@ -114,8 +89,7 @@ def format_telegram_notification(
     quantity: float,
     stop_loss: Optional[float],
     take_profit: Optional[float],
-    order_id: Optional[str] = None,
-    testnet: bool = False
+    order_id: Optional[str] = None
 ) -> str:
     """
     Format trade notification for Telegram.
@@ -128,15 +102,13 @@ def format_telegram_notification(
         stop_loss: Stop loss price (optional)
         take_profit: Take profit price (optional)
         order_id: Bybit order ID (optional)
-        testnet: Whether order was placed on testnet
         
     Returns:
         Formatted message string
     """
     emoji = "🟢" if action.upper() in ["BUY", "LONG"] else "🔴"
-    env_tag = "🧪 TESTNET" if testnet else "🔥 LIVE"
     
-    message = f"{emoji} <b>Trade Executed</b> {env_tag}\n\n"
+    message = f"{emoji} <b>Trade Executed</b>\n\n"
     message += f"<b>Symbol:</b> {symbol}\n"
     message += f"<b>Action:</b> {action.upper()}\n"
     message += f"<b>Quantity:</b> {quantity}\n"
@@ -150,6 +122,8 @@ def format_telegram_notification(
     
     if order_id:
         message += f"<b>Order ID:</b> {order_id}\n"
+    
+    message += f"\n<i>Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</i>"
     
     return message
 
@@ -173,14 +147,20 @@ def calculate_position_size(
         Position size (quantity) or None if calculation fails
     """
     try:
-        # Get account balance using configured ACCOUNT_TYPE
+        # ✅ Bybit V5: Get account balance
         response = bybit_client.get_wallet_balance(
-            accountType=ACCOUNT_TYPE,
+            accountType="UNIFIED",
             coin="USDT"
         )
         
+        # ✅ Check Bybit V5 response
         if response.get('retCode') != 0:
-            logger.error(f"Failed to get account balance: {response.get('retMsg')}")
+            error_msg = response.get('retMsg', 'Unknown error')
+            logger.error(f"Failed to get account balance - retCode: {response.get('retCode')}, retMsg: {error_msg}")
+            send_telegram_error("Balance Fetch Failed", {
+                "Error Code": response.get('retCode'),
+                "Error Message": error_msg
+            })
             return None
         
         # Extract available balance
@@ -203,28 +183,34 @@ def calculate_position_size(
         
         if total_equity <= 0:
             logger.error("No USDT balance found")
+            send_telegram_message("⚠️ <b>Warning:</b> No USDT balance found in account")
             return None
+        
+        logger.info(f"Account USDT Balance: {total_equity}")
         
         # Calculate position size based on risk percentage
         risk_amount = total_equity * risk_percent
         position_size = risk_amount / price
         
-        # Get symbol info to apply minimum/maximum constraints
+        # ✅ Bybit V5: Get symbol info with category parameter
         try:
             instruments_response = bybit_client.get_instruments_info(
-                category=CATEGORY,
+                category="linear",
                 symbol=symbol
             )
             
+            # ✅ Check Bybit V5 response
             if instruments_response.get('retCode') == 0:
                 result = instruments_response.get('result', {})
                 instruments = result.get('list', [])
                 
                 if instruments:
                     instrument = instruments[0]
-                    min_qty = float(instrument.get('lotSizeFilter', {}).get('minOrderQty', 0))
-                    max_qty = float(instrument.get('lotSizeFilter', {}).get('maxOrderQty', float('inf')))
-                    qty_step = float(instrument.get('lotSizeFilter', {}).get('qtyStep', 0.001))
+                    lot_size_filter = instrument.get('lotSizeFilter', {})
+                    
+                    min_qty = float(lot_size_filter.get('minOrderQty', 0))
+                    max_qty = float(lot_size_filter.get('maxOrderQty', float('inf')))
+                    qty_step = float(lot_size_filter.get('qtyStep', 0.001))
                     
                     # Round to nearest qty step
                     position_size = round(position_size / qty_step) * qty_step
@@ -233,7 +219,11 @@ def calculate_position_size(
                     position_size = max(min_qty, min(position_size, max_qty))
                     
                     logger.info(f"Calculated position size: {position_size} for symbol {symbol}")
+                    logger.info(f"Symbol constraints - Min: {min_qty}, Max: {max_qty}, Step: {qty_step}")
+                    
                     return position_size
+            else:
+                logger.warning(f"Could not fetch symbol info - retCode: {instruments_response.get('retCode')}, retMsg: {instruments_response.get('retMsg')}")
                     
         except Exception as e:
             logger.warning(f"Could not fetch symbol info, using unrounded position size: {str(e)}")
@@ -243,6 +233,10 @@ def calculate_position_size(
         
     except Exception as e:
         logger.error(f"Error calculating position size: {str(e)}")
+        send_telegram_error("Position Size Calculation Failed", {
+            "Symbol": symbol,
+            "Error": str(e)
+        })
         return None
 
 
@@ -255,7 +249,7 @@ def execute_bybit_order(
     take_profit: Optional[float] = None
 ) -> Dict[str, Any]:
     """
-    Execute order on Bybit Perpetual Futures with integrated SL/TP.
+    Execute order on Bybit Perpetual Futures (V5 API).
     
     Args:
         bybit_client: Bybit HTTP client instance
@@ -272,52 +266,108 @@ def execute_bybit_order(
         # Normalize action to Bybit side
         side = "Buy" if action.upper() in ["BUY", "LONG"] else "Sell"
         
-        # Build order parameters with integrated SL/TP using configured CATEGORY
+        # ✅ Bybit V5: Convert quantity to string (avoid precision errors)
+        qty_str = f"{quantity:.4f}".rstrip('0').rstrip('.')
+        
+        logger.info(f"Placing {side} order for {symbol} - Qty: {qty_str}")
+        
+        # ✅ Bybit V5: Place market order (category="linear", no price parameter)
         order_params = {
-            "category": CATEGORY,
+            "category": "linear",
             "symbol": symbol,
             "side": side,
             "orderType": "Market",
-            "qty": str(quantity),
-            "positionIdx": 0,
+            "qty": qty_str,
+            "positionIdx": 0,  # One-Way Mode
             "reduceOnly": False
         }
         
-        # Add stop loss if provided
-        if stop_loss:
-            order_params["stopLoss"] = str(stop_loss)
-            order_params["slTriggerBy"] = "LastPrice"
+        logger.info(f"Order parameters: {json.dumps(order_params)}")
         
-        # Add take profit if provided
-        if take_profit:
-            order_params["takeProfit"] = str(take_profit)
-            order_params["tpTriggerBy"] = "LastPrice"
-        
-        logger.info(f"Placing order on {'TESTNET' if BYBIT_TESTNET else 'MAINNET'}: {order_params}")
-        
-        # Place market order with integrated SL/TP
         order_response = bybit_client.place_order(**order_params)
         
+        # ✅ Bybit V5: Enhanced error handling with retCode and retMsg
         if order_response.get('retCode') != 0:
+            error_code = order_response.get('retCode')
             error_msg = order_response.get('retMsg', 'Unknown error')
-            logger.error(f"Bybit order failed: {error_msg}")
+            
+            logger.error(f"Bybit order failed - retCode: {error_code}, retMsg: {error_msg}")
+            
+            # Send detailed error to Telegram
+            send_telegram_error("Order Placement Failed", {
+                "Symbol": symbol,
+                "Action": side,
+                "Quantity": qty_str,
+                "Error Code": error_code,
+                "Error Message": error_msg,
+                "Full Response": json.dumps(order_response, indent=2)
+            })
+            
             return {
                 'success': False,
                 'error': error_msg,
+                'error_code': error_code,
                 'response': order_response
             }
         
         order_id = order_response.get('result', {}).get('orderId')
         order_link_id = order_response.get('result', {}).get('orderLinkId')
         
-        logger.info(f"Order placed successfully: {order_id}")
+        logger.info(f"Order placed successfully - Order ID: {order_id}")
         
-        # Get fill price from order execution
+        # ✅ Bybit V5: Set stop loss and take profit
+        # Wait for position to be established
+        time.sleep(1.0)
+        
+        if stop_loss or take_profit:
+            try:
+                trading_stop_params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "positionIdx": 0
+                }
+                
+                # ✅ Bybit V5: Convert SL/TP to strings
+                if stop_loss:
+                    sl_str = f"{stop_loss:.4f}".rstrip('0').rstrip('.')
+                    trading_stop_params["stopLoss"] = sl_str
+                    logger.info(f"Setting Stop Loss: {sl_str}")
+                
+                if take_profit:
+                    tp_str = f"{take_profit:.4f}".rstrip('0').rstrip('.')
+                    trading_stop_params["takeProfit"] = tp_str
+                    logger.info(f"Setting Take Profit: {tp_str}")
+                
+                logger.info(f"SL/TP parameters: {json.dumps(trading_stop_params)}")
+                
+                sl_tp_response = bybit_client.set_trading_stop(**trading_stop_params)
+                
+                # ✅ Bybit V5: Check SL/TP response
+                if sl_tp_response.get('retCode') == 0:
+                    logger.info(f"Stop loss and take profit set successfully")
+                else:
+                    error_msg = sl_tp_response.get('retMsg', 'Unknown error')
+                    logger.warning(f"Failed to set SL/TP - retCode: {sl_tp_response.get('retCode')}, retMsg: {error_msg}")
+                    
+                    send_telegram_error("SL/TP Setup Failed", {
+                        "Symbol": symbol,
+                        "Error Code": sl_tp_response.get('retCode'),
+                        "Error Message": error_msg,
+                        "Note": "Order was placed successfully but SL/TP failed"
+                    })
+                    
+            except Exception as e:
+                logger.warning(f"Error setting stop loss/take profit: {str(e)}")
+                send_telegram_message(f"⚠️ <b>Warning:</b> SL/TP setup failed\n\n{str(e)}")
+        
+        # ✅ Bybit V5: Get fill price from execution history
         fill_price = None
         try:
-            # Try to get from trade history
+            time.sleep(0.5)
+            
+            # ✅ Use category parameter for V5
             trade_response = bybit_client.get_executions(
-                category=CATEGORY,
+                category="linear",
                 symbol=symbol,
                 limit=1
             )
@@ -326,6 +376,9 @@ def execute_bybit_order(
                 executions = trade_response.get('result', {}).get('list', [])
                 if executions:
                     fill_price = float(executions[0].get('execPrice', 0))
+                    logger.info(f"Fill price retrieved: {fill_price}")
+            else:
+                logger.warning(f"Could not retrieve fill price - retCode: {trade_response.get('retCode')}")
                     
         except Exception as e:
             logger.warning(f"Could not retrieve fill price: {str(e)}")
@@ -338,42 +391,32 @@ def execute_bybit_order(
         }
         
     except Exception as e:
-        logger.error(f"Error executing Bybit order: {str(e)}")
+        logger.error(f"Error executing Bybit order: {str(e)}", exc_info=True)
+        
+        send_telegram_error("Order Execution Error", {
+            "Symbol": symbol,
+            "Action": action,
+            "Error": str(e)
+        })
+        
         return {
             'success': False,
             'error': str(e)
         }
 
 
-def extract_field(body: Dict[str, Any], *field_names: str) -> Optional[Any]:
-    """
-    Extract field from body with case-insensitive fallback.
-    
-    Args:
-        body: Request body dictionary
-        field_names: List of possible field names to check
-        
-    Returns:
-        Field value or None if not found
-    """
-    for field in field_names:
-        if field in body and body[field] is not None:
-            return body[field]
-    return None
-
-
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     AWS Lambda handler function for TradingView webhook.
     
-    Expected JSON payload (case-insensitive):
+    Expected JSON payload from TradingView:
     {
-        "action": "BUY" or "SELL",
-        "symbol": "BYBIT:BTCUSDT.P" (will be normalized to "BTCUSDT"),
-        "qty": 0.01 (optional),
-        "price": 50000.0 (optional, for position sizing),
-        "sl" or "SL": 49000.0 (optional),
-        "tp" or "TP": 51000.0 (optional)
+        "action": "buy",
+        "symbol": "BTCUSDT",
+        "qty": 0.5,
+        "category": "linear",
+        "sl": 42150.50,
+        "tp": 43500.75
     }
     
     Args:
@@ -406,63 +449,64 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         logger.info(f"Received webhook payload: {json.dumps(body)}")
         
-        # Extract parameters with case-insensitive fallback
-        action = extract_field(body, 'action', 'Action', 'ACTION')
-        raw_symbol = extract_field(body, 'symbol', 'Symbol', 'SYMBOL', 'ticker', 'Ticker')
-        qty = extract_field(body, 'qty', 'Qty', 'QTY', 'quantity', 'Quantity', 'QUANTITY')
-        price = extract_field(body, 'price', 'Price', 'PRICE', 'entry', 'Entry', 'ENTRY', 'close', 'Close')
-        
-        # ENHANCED: Check both lowercase and uppercase variants for SL/TP
-        stop_loss = extract_field(body, 'sl', 'SL', 'stop_loss', 'stopLoss', 'StopLoss', 'STOP_LOSS')
-        take_profit = extract_field(body, 'tp', 'TP', 'take_profit', 'takeProfit', 'TakeProfit', 'TAKE_PROFIT')
+        # ✅ Extract parameters (case-insensitive)
+        action = body.get('action') or body.get('Action') or body.get('ACTION')
+        symbol = body.get('symbol') or body.get('Symbol') or body.get('SYMBOL')
+        qty = body.get('qty') or body.get('Qty') or body.get('QTY') or body.get('quantity')
+        price = body.get('price') or body.get('Price') or body.get('entry')
+        stop_loss = body.get('sl') or body.get('SL') or body.get('stopLoss')
+        take_profit = body.get('tp') or body.get('TP') or body.get('takeProfit')
         
         # Validate required fields
         if not action:
+            error_msg = 'Missing required field: action'
+            logger.error(error_msg)
+            send_telegram_message(f"❌ <b>Webhook Error:</b> {error_msg}")
             return {
                 'statusCode': 400,
                 'body': json.dumps({
                     'success': False,
-                    'error': 'Missing required field: action'
+                    'error': error_msg
                 })
             }
-        
-        if not raw_symbol:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'success': False,
-                    'error': 'Missing required field: symbol'
-                })
-            }
-        
-        # ENHANCED: Normalize symbol format (removes BYBIT:, .P, etc.)
-        symbol = normalize_symbol(raw_symbol)
         
         if not symbol:
+            error_msg = 'Missing required field: symbol'
+            logger.error(error_msg)
+            send_telegram_message(f"❌ <b>Webhook Error:</b> {error_msg}")
             return {
                 'statusCode': 400,
                 'body': json.dumps({
                     'success': False,
-                    'error': f'Invalid symbol format: {raw_symbol}'
+                    'error': error_msg
                 })
             }
         
-        # Initialize Bybit client with TESTNET configuration
+        # ✅ Normalize symbol format (Bybit V5 uses uppercase, no .P suffix)
+        symbol = symbol.upper().replace('.P', '').replace('-', '')
+        
+        logger.info(f"Normalized symbol: {symbol}")
+        
+        # ✅ Initialize Bybit V5 client
         try:
             bybit_client = HTTP(
                 testnet=BYBIT_TESTNET,
                 api_key=BYBIT_API_KEY,
                 api_secret=BYBIT_API_SECRET
             )
-            logger.info(f"Bybit client initialized: {'TESTNET' if BYBIT_TESTNET else 'MAINNET'}")
+            logger.info(f"Bybit client initialized - Testnet: {BYBIT_TESTNET}")
         except Exception as e:
-            logger.error(f"Failed to initialize Bybit client: {str(e)}")
-            send_telegram_message(f"❌ <b>Error:</b> Failed to initialize Bybit client: {str(e)}")
+            error_msg = f"Failed to initialize Bybit client: {str(e)}"
+            logger.error(error_msg)
+            send_telegram_error("Bybit Client Initialization Failed", {
+                "Error": str(e),
+                "Testnet": BYBIT_TESTNET
+            })
             return {
                 'statusCode': 500,
                 'body': json.dumps({
                     'success': False,
-                    'error': f'Failed to initialize Bybit client: {str(e)}'
+                    'error': error_msg
                 })
             }
         
@@ -471,17 +515,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if qty:
             try:
                 quantity = float(qty)
+                logger.info(f"Using provided quantity: {quantity}")
             except (ValueError, TypeError):
                 logger.warning(f"Invalid qty value: {qty}, will calculate dynamically")
         
         if not quantity or quantity <= 0:
             if not price:
-                logger.error("Cannot calculate position size: price is required when qty is not provided")
+                error_msg = "Cannot calculate position size: price is required when qty is not provided"
+                logger.error(error_msg)
+                send_telegram_message(f"❌ <b>Error:</b> {error_msg}")
                 return {
                     'statusCode': 400,
                     'body': json.dumps({
                         'success': False,
-                        'error': 'Either qty or price must be provided for position sizing'
+                        'error': error_msg
                     })
                 }
             
@@ -490,21 +537,25 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 quantity = calculate_position_size(bybit_client, symbol, entry_price)
                 
                 if not quantity or quantity <= 0:
+                    error_msg = 'Failed to calculate position size'
+                    logger.error(error_msg)
                     return {
                         'statusCode': 500,
                         'body': json.dumps({
                             'success': False,
-                            'error': 'Failed to calculate position size'
+                            'error': error_msg
                         })
                     }
                     
             except (ValueError, TypeError) as e:
-                logger.error(f"Invalid price value: {price}")
+                error_msg = f'Invalid price value: {price}'
+                logger.error(error_msg)
+                send_telegram_message(f"❌ <b>Error:</b> {error_msg}")
                 return {
                     'statusCode': 400,
                     'body': json.dumps({
                         'success': False,
-                        'error': f'Invalid price value: {price}'
+                        'error': error_msg
                     })
                 }
         
@@ -521,7 +572,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.warning(f"Invalid take profit value: {take_profit}")
             tp_price = None
         
-        # Execute order
+        logger.info(f"Final order parameters - Symbol: {symbol}, Action: {action}, Qty: {quantity}, SL: {sl_price}, TP: {tp_price}")
+        
+        # ✅ Execute order with Bybit V5 API
         order_result = execute_bybit_order(
             bybit_client=bybit_client,
             action=action,
@@ -533,14 +586,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         if not order_result.get('success'):
             error_msg = order_result.get('error', 'Unknown error')
-            env_tag = "🧪 TESTNET" if BYBIT_TESTNET else "🔥 LIVE"
-            send_telegram_message(f"❌ <b>Order Failed</b> {env_tag}\n\nSymbol: {symbol}\nAction: {action}\nError: {error_msg}")
+            error_code = order_result.get('error_code', 'N/A')
+            
+            send_telegram_error("Order Execution Failed", {
+                "Symbol": symbol,
+                "Action": action,
+                "Quantity": quantity,
+                "Error Code": error_code,
+                "Error Message": error_msg
+            })
             
             return {
                 'statusCode': 500,
                 'body': json.dumps({
                     'success': False,
-                    'error': error_msg
+                    'error': error_msg,
+                    'error_code': error_code
                 })
             }
         
@@ -550,9 +611,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             try:
                 fill_price = float(price)
             except (ValueError, TypeError):
-                pass
+                fill_price = 0.0
         
-        # Send Telegram notification
+        # Send Telegram success notification
         telegram_message = format_telegram_notification(
             symbol=symbol,
             action=action,
@@ -560,8 +621,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             quantity=quantity,
             stop_loss=sl_price,
             take_profit=tp_price,
-            order_id=order_result.get('order_id'),
-            testnet=BYBIT_TESTNET
+            order_id=order_result.get('order_id')
         )
         send_telegram_message(telegram_message)
         
@@ -569,18 +629,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         response_data = {
             'success': True,
             'symbol': symbol,
-            'original_symbol': raw_symbol,
             'action': action,
             'quantity': quantity,
             'order_id': order_result.get('order_id'),
+            'fill_price': fill_price,
             'stop_loss': sl_price,
             'take_profit': tp_price,
-            'testnet': BYBIT_TESTNET,
-            'category': CATEGORY,
-            'account_type': ACCOUNT_TYPE
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
         }
         
-        logger.info(f"Order executed successfully: {response_data}")
+        logger.info(f"Order executed successfully: {json.dumps(response_data)}")
         
         return {
             'statusCode': 200,
@@ -588,23 +646,30 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
         
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {str(e)}")
+        error_msg = f'Invalid JSON: {str(e)}'
+        logger.error(error_msg)
+        send_telegram_message(f"❌ <b>JSON Parse Error:</b> {error_msg}")
         return {
             'statusCode': 400,
             'body': json.dumps({
                 'success': False,
-                'error': f'Invalid JSON: {str(e)}'
+                'error': error_msg
             })
         }
         
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        send_telegram_message(f"❌ <b>Unexpected Error</b>\n\n{str(e)}")
+        error_msg = f'Internal server error: {str(e)}'
+        logger.error(error_msg, exc_info=True)
+        
+        send_telegram_error("Unexpected Lambda Error", {
+            "Error": str(e),
+            "Type": type(e).__name__
+        })
         
         return {
             'statusCode': 500,
             'body': json.dumps({
                 'success': False,
-                'error': f'Internal server error: {str(e)}'
+                'error': error_msg
             })
         }
