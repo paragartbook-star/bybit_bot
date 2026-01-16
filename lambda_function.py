@@ -89,36 +89,46 @@ def format_telegram_notification(
     quantity: float,
     stop_loss: Optional[float],
     take_profit: Optional[float],
-    order_id: Optional[str] = None
+    order_id: Optional[str] = None,
+    trailing_stop: Optional[float] = None
 ) -> str:
     """
     Format trade notification for Telegram.
     
     Args:
         symbol: Trading symbol
-        action: Order action (Buy/Sell)
+        action: Order action (Buy/Sell/Update)
         entry_price: Entry price
         quantity: Position quantity
         stop_loss: Stop loss price (optional)
         take_profit: Take profit price (optional)
         order_id: Bybit order ID (optional)
+        trailing_stop: Trailing stop value (optional)
         
     Returns:
         Formatted message string
     """
-    emoji = "🟢" if action.upper() in ["BUY", "LONG"] else "🔴"
+    if action.upper() == "UPDATE":
+        emoji = "🔄"
+    else:
+        emoji = "🟢" if action.upper() in ["BUY", "LONG"] else "🔴"
     
-    message = f"{emoji} <b>Trade Executed</b>\n\n"
+    message = f"{emoji} <b>Trade {action.upper()}</b>\n\n"
     message += f"<b>Symbol:</b> {symbol}\n"
-    message += f"<b>Action:</b> {action.upper()}\n"
-    message += f"<b>Quantity:</b> {quantity}\n"
-    message += f"<b>Entry:</b> ${entry_price:.4f}\n"
+    
+    if action.upper() != "UPDATE":
+        message += f"<b>Action:</b> {action.upper()}\n"
+        message += f"<b>Quantity:</b> {quantity}\n"
+        message += f"<b>Entry:</b> ${entry_price:.4f}\n"
     
     if stop_loss:
         message += f"<b>Stop Loss:</b> ${stop_loss:.4f}\n"
     
     if take_profit:
         message += f"<b>Take Profit:</b> ${take_profit:.4f}\n"
+    
+    if trailing_stop:
+        message += f"<b>Trailing Stop:</b> ${trailing_stop:.4f}\n"
     
     if order_id:
         message += f"<b>Order ID:</b> {order_id}\n"
@@ -231,13 +241,115 @@ def calculate_position_size(
         return None
 
 
+def update_position_stops(
+    bybit_client: HTTP,
+    symbol: str,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    trailing_stop: Optional[float] = None
+) -> Dict[str, Any]:
+    """
+    Update stop loss, take profit, or trailing stop for an existing position.
+    
+    Args:
+        bybit_client: Bybit HTTP client instance
+        symbol: Trading symbol
+        stop_loss: Stop loss price (optional)
+        take_profit: Take profit price (optional)
+        trailing_stop: Trailing stop value in price units (optional)
+        
+    Returns:
+        Dictionary with update result or error information
+    """
+    try:
+        logger.info(f"Updating position stops for {symbol}")
+        
+        # Build parameters for set_trading_stop
+        trading_stop_params = {
+            "category": "linear",
+            "symbol": symbol,
+            "positionIdx": 0  # One-Way Mode
+        }
+        
+        # Add stop loss if provided
+        if stop_loss is not None:
+            sl_str = f"{stop_loss:.4f}".rstrip('0').rstrip('.')
+            trading_stop_params["stopLoss"] = sl_str
+            logger.info(f"Setting Stop Loss: {sl_str}")
+        
+        # Add take profit if provided
+        if take_profit is not None:
+            tp_str = f"{take_profit:.4f}".rstrip('0').rstrip('.')
+            trading_stop_params["takeProfit"] = tp_str
+            logger.info(f"Setting Take Profit: {tp_str}")
+        
+        # Add trailing stop if provided
+        if trailing_stop is not None:
+            ts_str = f"{trailing_stop:.4f}".rstrip('0').rstrip('.')
+            trading_stop_params["trailingStop"] = ts_str
+            logger.info(f"Setting Trailing Stop: {ts_str}")
+        
+        # Check if at least one parameter is provided
+        if len(trading_stop_params) <= 3:  # Only category, symbol, positionIdx
+            error_msg = "No stop loss, take profit, or trailing stop provided for update"
+            logger.error(error_msg)
+            return {
+                'success': False,
+                'error': error_msg
+            }
+        
+        logger.info(f"Update parameters: {json.dumps(trading_stop_params)}")
+        
+        # Execute the update
+        update_response = bybit_client.set_trading_stop(**trading_stop_params)
+        
+        # Check response
+        if update_response.get('retCode') == 0:
+            logger.info(f"Position stops updated successfully for {symbol}")
+            return {
+                'success': True,
+                'symbol': symbol,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'trailing_stop': trailing_stop
+            }
+        else:
+            error_code = update_response.get('retCode')
+            error_msg = update_response.get('retMsg', 'Unknown error')
+            
+            # Handle error 34040 (not modified) gracefully
+            if error_code == 34040:
+                logger.warning(f"Position stops not modified (error 34040) - values may already be set or identical")
+                return {
+                    'success': True,
+                    'warning': "Position stops not modified - values may already be set",
+                    'symbol': symbol
+                }
+            else:
+                logger.error(f"Failed to update position stops - retCode: {error_code}, retMsg: {error_msg}")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_code': error_code,
+                    'response': update_response
+                }
+        
+    except Exception as e:
+        logger.error(f"Error updating position stops: {str(e)}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
 def execute_bybit_order(
     bybit_client: HTTP,
     action: str,
     symbol: str,
     quantity: float,
     stop_loss: Optional[float] = None,
-    take_profit: Optional[float] = None
+    take_profit: Optional[float] = None,
+    trailing_stop: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Execute order on Bybit Perpetual Futures (V5 API).
@@ -249,6 +361,7 @@ def execute_bybit_order(
         quantity: Position quantity
         stop_loss: Stop loss price (optional)
         take_profit: Take profit price (optional)
+        trailing_stop: Trailing stop value (optional)
         
     Returns:
         Dictionary with order result or error information
@@ -296,13 +409,13 @@ def execute_bybit_order(
         
         logger.info(f"Order placed successfully - Order ID: {order_id}")
         
-        # ✅ Bybit V5: Set stop loss and take profit
+        # ✅ Bybit V5: Set stop loss, take profit, and/or trailing stop
         # Wait for position to be established
         time.sleep(1.0)
         
         sl_tp_warning = None  # Track SL/TP warnings to return to main handler
         
-        if stop_loss or take_profit:
+        if stop_loss or take_profit or trailing_stop:
             try:
                 trading_stop_params = {
                     "category": "linear",
@@ -310,7 +423,7 @@ def execute_bybit_order(
                     "positionIdx": 0
                 }
                 
-                # ✅ Bybit V5: Convert SL/TP to strings
+                # ✅ Bybit V5: Convert SL/TP/TS to strings
                 if stop_loss:
                     sl_str = f"{stop_loss:.4f}".rstrip('0').rstrip('.')
                     trading_stop_params["stopLoss"] = sl_str
@@ -321,28 +434,33 @@ def execute_bybit_order(
                     trading_stop_params["takeProfit"] = tp_str
                     logger.info(f"Setting Take Profit: {tp_str}")
                 
-                logger.info(f"SL/TP parameters: {json.dumps(trading_stop_params)}")
+                if trailing_stop:
+                    ts_str = f"{trailing_stop:.4f}".rstrip('0').rstrip('.')
+                    trading_stop_params["trailingStop"] = ts_str
+                    logger.info(f"Setting Trailing Stop: {ts_str}")
+                
+                logger.info(f"SL/TP/TS parameters: {json.dumps(trading_stop_params)}")
                 
                 sl_tp_response = bybit_client.set_trading_stop(**trading_stop_params)
                 
                 # ✅ Bybit V5: Check SL/TP response
                 if sl_tp_response.get('retCode') == 0:
-                    logger.info(f"Stop loss and take profit set successfully")
+                    logger.info(f"Stop loss, take profit, and trailing stop set successfully")
                 else:
                     error_code = sl_tp_response.get('retCode')
                     error_msg = sl_tp_response.get('retMsg', 'Unknown error')
                     
-                    # 🔵 IMPROVEMENT 2: Handle error 34040 (not modified) gracefully
+                    # Handle error 34040 (not modified) gracefully
                     if error_code == 34040:
-                        logger.warning(f"SL/TP not modified (error 34040) - SL/TP may already be set or identical to existing values")
-                        sl_tp_warning = "SL/TP not modified (34040) - values may already be set"
+                        logger.warning(f"SL/TP/TS not modified (error 34040) - values may already be set or identical to existing values")
+                        sl_tp_warning = "SL/TP/TS not modified (34040) - values may already be set"
                     else:
-                        logger.warning(f"Failed to set SL/TP - retCode: {error_code}, retMsg: {error_msg}")
-                        sl_tp_warning = f"SL/TP setup failed: {error_msg} (Code: {error_code})"
+                        logger.warning(f"Failed to set SL/TP/TS - retCode: {error_code}, retMsg: {error_msg}")
+                        sl_tp_warning = f"SL/TP/TS setup failed: {error_msg} (Code: {error_code})"
                     
             except Exception as e:
-                logger.warning(f"Error setting stop loss/take profit: {str(e)}")
-                sl_tp_warning = f"SL/TP setup exception: {str(e)}"
+                logger.warning(f"Error setting stop loss/take profit/trailing stop: {str(e)}")
+                sl_tp_warning = f"SL/TP/TS setup exception: {str(e)}"
         
         # ✅ Bybit V5: Get fill price from execution history
         fill_price = None
@@ -389,13 +507,25 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     AWS Lambda handler function for TradingView webhook.
     
     Expected JSON payload from TradingView:
+    
+    For new orders:
     {
         "action": "buy",
         "symbol": "BTCUSDT",
         "qty": 0.5,
         "category": "linear",
         "sl": 42150.50,
-        "tp": 43500.75
+        "tp": 43500.75,
+        "trailing_stop": 100.0
+    }
+    
+    For position updates:
+    {
+        "action": "update",
+        "symbol": "BTCUSDT",
+        "sl": 42500.00,
+        "tp": 44000.00,
+        "trailing_stop": 150.0
     }
     
     Args:
@@ -405,7 +535,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         HTTP response dictionary
     """
-    # 🔵 Initialize Telegram flag at the very beginning
+    # Initialize Telegram flag at the very beginning
     telegram_sent = False
     
     # Validate environment variables
@@ -438,6 +568,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         price = body.get('price') or body.get('Price') or body.get('entry')
         stop_loss = body.get('sl') or body.get('SL') or body.get('stopLoss')
         take_profit = body.get('tp') or body.get('TP') or body.get('takeProfit')
+        trailing_stop = body.get('trailing_stop') or body.get('trailingStop') or body.get('ts')
         
         # Validate required fields
         if not action:
@@ -498,6 +629,117 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 })
             }
         
+        # ========== NEW: HANDLE UPDATE ACTION ==========
+        if action.upper() == "UPDATE":
+            logger.info(f"Processing UPDATE action for {symbol}")
+            
+            # Convert optional fields to float
+            try:
+                sl_price = float(stop_loss) if stop_loss else None
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid stop loss value: {stop_loss}")
+                sl_price = None
+            
+            try:
+                tp_price = float(take_profit) if take_profit else None
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid take profit value: {take_profit}")
+                tp_price = None
+            
+            try:
+                ts_price = float(trailing_stop) if trailing_stop else None
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid trailing stop value: {trailing_stop}")
+                ts_price = None
+            
+            # Execute position update with error handling
+            try:
+                update_result = update_position_stops(
+                    bybit_client=bybit_client,
+                    symbol=symbol,
+                    stop_loss=sl_price,
+                    take_profit=tp_price,
+                    trailing_stop=ts_price
+                )
+                
+                if not update_result.get('success'):
+                    error_msg = update_result.get('error', 'Unknown error')
+                    error_code = update_result.get('error_code', 'N/A')
+                    
+                    if not telegram_sent:
+                        send_telegram_error("Position Update Failed", {
+                            "Symbol": symbol,
+                            "Error Code": error_code,
+                            "Error Message": error_msg
+                        })
+                        telegram_sent = True
+                    
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps({
+                            'success': False,
+                            'error': error_msg,
+                            'error_code': error_code
+                        })
+                    }
+                
+                # Send success notification
+                if not telegram_sent:
+                    telegram_message = format_telegram_notification(
+                        symbol=symbol,
+                        action="UPDATE",
+                        entry_price=0.0,  # Not applicable for updates
+                        quantity=0.0,  # Not applicable for updates
+                        stop_loss=sl_price,
+                        take_profit=tp_price,
+                        trailing_stop=ts_price
+                    )
+                    
+                    # Add warning if present
+                    if update_result.get('warning'):
+                        telegram_message += f"\n\n⚠️ <i>{update_result['warning']}</i>"
+                    
+                    send_telegram_message(telegram_message)
+                    telegram_sent = True
+                
+                # Return success response
+                response_data = {
+                    'success': True,
+                    'action': 'update',
+                    'symbol': symbol,
+                    'stop_loss': sl_price,
+                    'take_profit': tp_price,
+                    'trailing_stop': ts_price,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+                }
+                
+                logger.info(f"Position updated successfully: {json.dumps(response_data)}")
+                
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps(response_data)
+                }
+                
+            except Exception as update_error:
+                error_msg = f"Exception during position update: {str(update_error)}"
+                logger.error(error_msg, exc_info=True)
+                
+                if not telegram_sent:
+                    send_telegram_error("Position Update Exception", {
+                        "Symbol": symbol,
+                        "Error": str(update_error)
+                    })
+                    telegram_sent = True
+                
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'success': False,
+                        'error': error_msg
+                    })
+                }
+        
+        # ========== EXISTING: HANDLE BUY/SELL ACTIONS ==========
         # Calculate quantity if not provided
         quantity = None
         if qty:
@@ -570,19 +812,25 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.warning(f"Invalid take profit value: {take_profit}")
             tp_price = None
         
-        logger.info(f"Final order parameters - Symbol: {symbol}, Action: {action}, Qty: {quantity}, SL: {sl_price}, TP: {tp_price}")
+        try:
+            ts_price = float(trailing_stop) if trailing_stop else None
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid trailing stop value: {trailing_stop}")
+            ts_price = None
         
-        # 🔵 IMPROVEMENT 1: Execute order (NO Telegram calls inside this function)
+        logger.info(f"Final order parameters - Symbol: {symbol}, Action: {action}, Qty: {quantity}, SL: {sl_price}, TP: {tp_price}, TS: {ts_price}")
+        
+        # Execute order
         order_result = execute_bybit_order(
             bybit_client=bybit_client,
             action=action,
             symbol=symbol,
             quantity=quantity,
             stop_loss=sl_price,
-            take_profit=tp_price
+            take_profit=tp_price,
+            trailing_stop=ts_price
         )
         
-        # 🔵 IMPROVEMENT 3: Only send error messages if order failed AND no success message was sent
         if not order_result.get('success'):
             error_msg = order_result.get('error', 'Unknown error')
             error_code = order_result.get('error_code', 'N/A')
@@ -614,9 +862,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except (ValueError, TypeError):
                 fill_price = 0.0
         
-        # 🔵 IMPROVEMENT 1: Send success notification ONLY from main handler
+        # Send success notification
         if not telegram_sent:
-            # Format success message
             telegram_message = format_telegram_notification(
                 symbol=symbol,
                 action=action,
@@ -624,10 +871,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 quantity=quantity,
                 stop_loss=sl_price,
                 take_profit=tp_price,
-                order_id=order_result.get('order_id')
+                order_id=order_result.get('order_id'),
+                trailing_stop=ts_price
             )
             
-            # 🔵 IMPROVEMENT 2: Add SL/TP warning if present
+            # Add SL/TP warning if present
             sl_tp_warning = order_result.get('sl_tp_warning')
             if sl_tp_warning:
                 telegram_message += f"\n\n⚠️ <i>{sl_tp_warning}</i>"
@@ -645,6 +893,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'fill_price': fill_price,
             'stop_loss': sl_price,
             'take_profit': tp_price,
+            'trailing_stop': ts_price,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
         }
         
